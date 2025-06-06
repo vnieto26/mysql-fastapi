@@ -1,30 +1,26 @@
-import os
-from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, Query
-from typing import Annotated
-from sqlmodel import Field, Session, create_engine, select, SQLModel, table
+from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi.security import OAuth2PasswordRequestForm
+from typing import Annotated, List
+from datetime import timedelta
+from sqlmodel import Session, select
 
-load_dotenv()
-db_username = os.getenv("USER_DB")
-db_password = os.getenv("PASSWORD_DB")
-db_host = os.getenv("HOST_DB")
-db_port = os.getenv("PORT_DB")
-db_name = os.getenv("NAME_DB")
-DATABASE_URL = f"mysql+pymysql://{db_username}:{db_password}@{db_host}:{db_port}/{db_name}"
-engine = create_engine(DATABASE_URL)
+from models import User, UserCreate, UserPublic, UserUpdate
+from auth import (
+    get_current_active_user,
+    create_access_token,
+    get_password_hash,
+    authenticate_user,
+    ACCESS_TOKEN_EXPIRE_MINUTES
+)
+from database import get_db, create_db_and_tables
+from sqlmodel import SQLModel, Field
 
-def create_db_and_tables():
-    SQLModel.metadata.create_all(engine)
+# Importar modelos de autenticación
+from models import Token
 
-def get_session():
-    with Session(engine) as session:
-        yield session
-
-session_dep = Annotated[Session, Depends(get_session)]
-
-# Modelo
+# Importar modelos de héroes
 class HeroBase(SQLModel):
-    name: str=Field(index=True)
+    name: str = Field(index=True)
     age: int | None = Field(default=None, index=True)
 
 class Hero(HeroBase, table=True):
@@ -42,59 +38,120 @@ class HeroUpdate(HeroBase):
     age: int | None = None
     secret_name: str | None = None
 
-# API rutas
-app = FastAPI()
+# Inicializar la aplicación FastAPI
+app = FastAPI(title="API de Héroes con Autenticación")
 
-@app.get("/")
-def root():
-    return {"message": "Hello World"}
-
+# Evento de inicio para crear tablas
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
 
-## Creacion de heroes
+# Rutas de autenticación
+@app.post("/token", response_model=Token)
+def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuario o contraseña incorrectos",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# Rutas de usuarios
+@app.post("/users/", response_model=UserPublic)
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = db.exec(select(User).where(User.username == user.username)).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="El nombre de usuario ya está registrado")
+    
+    hashed_password = get_password_hash(user.password)
+    db_user = User(
+        username=user.username,
+        email=user.email,
+        full_name=user.full_name,
+        hashed_password=hashed_password,
+        disabled=False
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+@app.get("/users/me/", response_model=UserPublic)
+def read_users_me(current_user: User = Depends(get_current_active_user)):
+    return current_user
+
+# Rutas de héroes (protegidas)
 @app.post("/heroes/", response_model=HeroPublic)
-def create_hero(hero: HeroCreate, session: session_dep):
+def create_hero(
+    hero: HeroCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
     db_hero = Hero.model_validate(hero)
-    session.add(db_hero)
-    session.commit()
-    session.refresh(db_hero)
+    db.add(db_hero)
+    db.commit()
+    db.refresh(db_hero)
     return db_hero
 
-## Listado de heroes
-@app.get("/heroes/", response_model=list[HeroPublic])
-def read_heroes(session: session_dep, offset: int = 0, limit: Annotated[int, Query(le=100)] = 100):
-    heroes = session.exec(select(Hero).offset(offset).limit(limit)).all()
+@app.get("/heroes/", response_model=List[HeroPublic])
+def read_heroes(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    heroes = db.exec(select(Hero).offset(skip).limit(limit)).all()
     return heroes
 
-## Busqueda de heroes
 @app.get("/heroes/{hero_id}", response_model=HeroPublic)
-def read_hero(hero_id: int, session: session_dep):
-    hero = session.get(Hero, hero_id)
-    if not hero:
-        raise HTTPException(status_code=404, detail="Heroe no encontrado")
+def read_hero(
+    hero_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    hero = db.get(Hero, hero_id)
+    if hero is None:
+        raise HTTPException(status_code=404, detail="Héroe no encontrado")
     return hero
 
-## Actualizacion de heroes
 @app.patch("/heroes/{hero_id}", response_model=HeroPublic)
-def update_hero(hero_id: int, hero: HeroUpdate, session: session_dep):
-    db_hero = session.get(Hero, hero_id)
-    if not db_hero:
-        raise HTTPException(status_code=404, detail="Heroe no encontrado")
-    hero_data = hero.model_dump(exclude_unset=True)
-    db_hero.sqlmodel_update(hero_data)
-    session.add(db_hero)
-    session.commit()
-    session.refresh(db_hero)
+def update_hero(
+    hero_id: int,
+    hero: HeroUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    db_hero = db.get(Hero, hero_id)
+    if db_hero is None:
+        raise HTTPException(status_code=404, detail="Héroe no encontrado")
+    
+    hero_data = hero.dict(exclude_unset=True)
+    for key, value in hero_data.items():
+        setattr(db_hero, key, value)
+    
+    db.add(db_hero)
+    db.commit()
+    db.refresh(db_hero)
     return db_hero
 
-## Eliminacion de heroes
 @app.delete("/heroes/{hero_id}")
-def delete_hero(hero_id: int, session: session_dep):
-    hero = session.get(Hero, hero_id)
-    if not hero:
-        raise HTTPException(status_code=404, detail="Heroe no encontrado")
-    session.delete(hero)
-    session.commit()
-    return {"message": "Heroe eliminado"}
+def delete_hero(
+    hero_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    hero = db.get(Hero, hero_id)
+    if hero is None:
+        raise HTTPException(status_code=404, detail="Héroe no encontrado")
+    db.delete(hero)
+    db.commit()
+    return {"message": "Héroe eliminado correctamente"}
